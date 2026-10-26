@@ -1,3 +1,10 @@
+/// 与之前一版不一样的原因：
+/// 1.存在两个需要保存的东西，一个是内核栈的栈顶指针，还有一个就是内核地址空间的token需要保存进satp中
+/// sscratch作为特殊的寄存器可以用来保存内核栈指针，但是内核地址空间的token没有办法保存，如果按照之前的办法将trap上下文保存进内核栈的话，需要首先切换为内核的地址空间，那用户的地址空间token就无法保存
+/// 所以采用了更加优化的办法，sscratch和sp继续交换，sscratch保存的是trap上下文的指针，先不更换地址空间，将trap上下文保存在用户地址空间的次高页，并且统一所有的用户程序，再切换到内核的地址空间
+///
+/// 2.trap陷入和切出指令统一放在trampoline跳板也的原因：
+/// 在trap陷入指令的时候需要切换内核和用户的token，放在最高页恒等映射在切换satp的值的时候，pc所在的真实地址不会应为页表的映射不同而改变
 .altmacro
 .macro SAVE_GP n
     sd x\n, \n*8(sp)
@@ -48,7 +55,7 @@ __restore:
     # switch to user space
     csrw satp, a1
     sfence.vma
-    csrw sscratch, a0
+    csrw sscratch, a0 ///sscratch的初始化
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it
     # restore sstatus/sepc
