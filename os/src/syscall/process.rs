@@ -1,9 +1,13 @@
 //! Process management syscalls
 use crate::config::PAGE_SIZE;
-use crate::mm::{translated_byte_buffer, PageTable, PTEFlags, VirtAddr};
+use crate::mm::{
+    check_user_read_translated_byte_buffer, check_user_write_translated_byte_buffer,
+    MapPermission, VirtAddr,
+};
 use crate::task::{
     change_program_brk, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next,
+    get_current_task_syscall_number, mmap_current_task_memory_set,
+    munmap_current_task_memory_set, suspend_current_and_run_next,
 };
 use crate::timer::get_time_us;
 
@@ -32,79 +36,135 @@ pub fn sys_yield() -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
-    let len = core::mem::size_of::<TimeVal>();
-    let start = ts as usize;
-    let Some(end) = start.checked_add(len) else {
-        return -1;
-    };
-    if start == 0 || end > (1usize << 38) {
-        return -1;
-    }
+    let token = current_user_token(); //现在用户空间的token
 
-    let token = current_user_token();
-    let page_table = PageTable::from_token(token);
-    let mut page_start = start;
-    while page_start < end {
-        let vpn = VirtAddr::from(page_start).floor();
-        let Some(pte) = page_table.translate(vpn) else {
-            return -1;
-        };
-        if !pte.is_valid() || !pte.writable() || !pte.flags().contains(PTEFlags::U) {
-            return -1;
-        }
-        page_start = ((page_start / PAGE_SIZE) + 1) * PAGE_SIZE;
-    }
-
+    //获取当前的系统时间并且写为时间结构体
     let time_us = get_time_us();
-    let time_val = TimeVal {
+    let time_val: TimeVal = TimeVal {
         sec: time_us / 1_000_000,
         usec: time_us % 1_000_000,
     };
 
-    let mut src = [0; core::mem::size_of::<TimeVal>()];
-    let (sec, usec) = src.split_at_mut(core::mem::size_of::<usize>());
-    sec.copy_from_slice(&time_val.sec.to_ne_bytes());
-    usec.copy_from_slice(&time_val.usec.to_ne_bytes());
+    //将需要传入进去的时间结构体转化为&[u8],便于写到用户传入的指针处
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
 
-    let mut offset = 0;
-    for chunk in translated_byte_buffer(token, ts as *const u8, len) {
-        let next_offset = offset + chunk.len();
-        chunk.copy_from_slice(&src[offset..next_offset]);
-        offset = next_offset;
+    //将需要写入的指针转化静态（使用page_table的对外开放函数，translated_byte_buffer(),对跨页数据指针也生效）可变为&[u8]切片，便于写入
+    if let Some(dst) = check_user_write_translated_byte_buffer(token, ts as *const u8, core::mem::size_of::<TimeVal>()) {
+        //将数据传入
+        let mut copied = 0;
+        for chunk in dst {
+            let n = chunk.len().min(src.len() - copied);
+            chunk[..n].copy_from_slice(&src[copied..copied + n]);
+            copied += n;
+            if copied >= src.len() {
+            break;
+            }
+        }
+
+        0
+    } else {
+        -1
     }
-    0
 }
 
 /// TODO: Finish sys_trace to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
+    let token = current_user_token(); //获取当前用户空间的token
     match trace_request {
         0 => {
-            let token = current_user_token();
-            let mut buf = translated_byte_buffer(token, trace_request as *cont u8, 1);
-            if buf.is_empty() {
-                
+            if let Some(dst) = check_user_read_translated_byte_buffer(token, id as *const u8, 1) {
+                dst[0][0] as usize as isize
+            } else {
+                -1
             }
         },
         1 => {
-            
+            if let Some(mut dst) = check_user_write_translated_byte_buffer(token, id as *mut u8, 1) {
+                let data = data as u8;
+                dst[0][0] = data;
+                0
+            } else {
+                -1
+            }
         },
         2 => {
-
+            get_current_task_syscall_number(id) as isize
+        },
+        _ => {
+            -1
         }
     }
 }
 
 // YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!("kernel: sys_mmap NOT IMPLEMENTED YET!");
-    -1
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+
+    if port & !0x7 != 0 || port & 0x7 == 0 {
+        return -1;
+    }
+
+    // len == 0 is valid and maps an empty range.
+    if len == 0 {
+        return 0;
+    }
+
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return -1,
+    };
+    let end = match end.checked_add(PAGE_SIZE - 1) {
+        Some(end) => end / PAGE_SIZE * PAGE_SIZE,
+        None => return -1,
+    };
+
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(end);
+
+    //获得mappermission
+    let mut permission = MapPermission::U;
+
+    if port & 0x1 != 0 {
+        permission |= MapPermission::R;
+    }
+
+    if port & 0x2 != 0 {
+        permission |= MapPermission::W;
+    }
+
+    if port & 0x4 != 0 {
+        permission |= MapPermission::X;
+    }
+
+    mmap_current_task_memory_set(start_va, end_va, permission)
 }
 
 // YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!("kernel: sys_munmap NOT IMPLEMENTED YET!");
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return -1,
+    };
+    let end = match end.checked_add(PAGE_SIZE - 1) {
+        Some(end) => end / PAGE_SIZE * PAGE_SIZE,
+        None => return -1,
+    };
+
+    let start_va = VirtAddr::from(start);
+    let end_va = VirtAddr::from(end);
+    munmap_current_task_memory_set(start_va, end_va)
 }
 /// change data segment size
 pub fn sys_sbrk(size: i32) -> isize {

@@ -262,6 +262,55 @@ impl MemorySet {
             false
         }
     }
+
+    /// Return whether every page in the half-open range is unmapped.
+    pub fn is_range_free(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        self.areas.iter().all(|area| {
+            end_vpn <= area.vpn_range.get_start()
+                || start_vpn >= area.vpn_range.get_end()
+        })
+    }
+
+    /// Return whether every page in the half-open range is mapped.
+    pub fn is_range_mapped(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        let mut current = start_vpn;
+        while current < end_vpn {
+            let mapped = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() <= current && current < area.vpn_range.get_end()
+            });
+
+            if !mapped {
+                return false;
+            }
+
+            current.step();
+        }
+
+        true
+    }
+
+    /// Remove and unmap the area that exactly matches the given range.
+    pub fn unmap_range(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+
+        let index = match self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        }) {
+            Some(index) => index,
+            None => return false,
+        };
+
+        let mut area = self.areas.remove(index);
+
+        area.unmap(&mut self.page_table);
+
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

@@ -70,6 +70,11 @@ impl PageTableEntry {
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
     }
+    //查看当前页是否是用户可见的
+    /// Return whether the page is accessible from user mode.
+    pub fn is_user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
+    }
 }
 
 /// page table structure
@@ -178,4 +183,67 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate a user buffer only if every page is user-readable.
+pub fn check_user_read_translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) => pte,
+            None => return None,
+        };
+        if !pte.is_user() || !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(& ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(& ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Some(v)
+}
+
+/// Translate a user buffer only if every page is user-writable.
+pub fn check_user_write_translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return None,
+    };
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = match page_table.translate(vpn) {
+            Some(pte) => pte,
+            None => return None,
+        };
+        if !pte.is_user() || !pte.writable() || !pte.readable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.into();
+    }
+    Some(v)
 }

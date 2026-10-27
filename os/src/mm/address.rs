@@ -81,7 +81,7 @@ impl From<PhysPageNum> for usize {
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
         if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
+            v.0 | !((1 << VA_WIDTH_SV39) - 1)
         } else {
             v.0
         }

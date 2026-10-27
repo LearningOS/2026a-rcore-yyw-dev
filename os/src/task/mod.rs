@@ -20,6 +20,7 @@ use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
+use crate::mm::{MapPermission, VirtAddr};
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -153,6 +154,63 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+    ///增加当前系统调用的次数
+    fn add_syscall_number(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current_idx = inner.current_task;
+        let current_task = &mut inner.tasks[current_idx];
+        if let Some(counter) = current_task
+            .syscall_counts
+            .iter_mut()
+            .find(|counter| counter.0 == syscall_id)
+        {
+            counter.1 = counter.1.wrapping_add(1);
+        } else if let Some(counter) = current_task
+            .syscall_counts
+            .iter_mut()
+            .find(|counter| counter.0 == usize::MAX)
+        {
+            *counter = (syscall_id, 1);
+        } else {
+            panic!("to many distinst syscalls tracked for one task!");
+        }
+    }
+    ///获取当前进程系统调用的次数
+    fn get_syscall_number(&self, syscall_id: usize) -> usize{
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task]
+            .syscall_counts
+            .iter()
+            .find(|counter| counter.0 == syscall_id)
+            .map(|counter| counter.1)
+            .unwrap_or(0)
+    }
+    fn mmap_memory_set(&self, start: VirtAddr, end: VirtAddr, permission: MapPermission) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if start > end {
+            return -1;
+        }
+        if !inner.tasks[current].memory_set.is_range_free(start, end) {
+            return -1;
+        }
+        inner.tasks[current].memory_set.insert_framed_area(start, end, permission);
+        0
+    }
+
+    fn munmap_memory_set(&self, start: VirtAddr, end: VirtAddr) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if !inner.tasks[current].memory_set.is_range_mapped(start, end) {
+            return -1;
+        }
+
+        if inner.tasks[current].memory_set.unmap_range(start, end) {
+            0
+        } else {
+            -1
+        }
+    }
 }
 
 /// Run the first task in task list.
@@ -201,4 +259,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+///获取当前进程调用次数
+pub fn get_current_task_syscall_number(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_syscall_number(syscall_id)
+}
+
+///增加当前系统调用的次数
+pub fn add_current_task_syscall_number(syscall_id: usize) {
+    TASK_MANAGER.add_syscall_number(syscall_id);
+}
+
+/// Map a framed range into the current task's address space.
+pub fn mmap_current_task_memory_set(start: VirtAddr, end: VirtAddr, permission: MapPermission) -> isize {
+    TASK_MANAGER.mmap_memory_set(start, end, permission)
+}
+
+/// Unmap a range from the current task's address space.
+pub fn munmap_current_task_memory_set(start: VirtAddr, end: VirtAddr) -> isize {
+    TASK_MANAGER.munmap_memory_set(start, end)
 }
