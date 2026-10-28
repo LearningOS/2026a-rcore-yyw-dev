@@ -58,6 +58,10 @@ impl PageTableEntry {
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
     }
+    /// Whether user mode may access this page.
+    pub fn is_user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
+    }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
@@ -181,6 +185,38 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate a user buffer only if each page is user-writable.
+pub fn check_user_write_translated_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.is_user() || !pte.readable() || !pte.writable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let page_end: VirtAddr = vpn.into();
+        let chunk_end = page_end.min(VirtAddr::from(end));
+        let end_offset = if chunk_end.page_offset() == 0 {
+            ppn.get_bytes_array().len()
+        } else {
+            chunk_end.page_offset()
+        };
+        buffers.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_offset]);
+        start = chunk_end.into();
+    }
+    Some(buffers)
 }
 
 /// Translate&Copy a ptr[u8] array end with `\0` to a `String` Vec through page table
